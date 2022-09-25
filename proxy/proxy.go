@@ -194,8 +194,10 @@ func (p *proxy) tokenManager(authID string, token tokenStruct, username string) 
 	tokenCache := token
 	tokenCacheLock := sync.RWMutex{}
 	logoutChan := make(chan struct{}, 1)
-	defer close(logoutChan)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-p.Global.Ctx.Done():
@@ -215,30 +217,98 @@ func (p *proxy) tokenManager(authID string, token tokenStruct, username string) 
 			}
 		}
 	}()
-	for {
-		select {
-		case <-p.Global.Ctx.Done():
-			return
-		case <-logoutChan:
-			_ = p.SessionLoginCache.Delete(authID)
-			p.Global.Logger.Println(clog.Info, "Logout success, username: ", username)
-			return
-		case <-time.After(2 * time.Second):
-			if p.SessionLoginCache.Exist(authID) {
-				tokenCacheLock.RLock()
-				if time.Now().Add(-60 * time.Second).After(tokenCache.ExpiredTime) {
-					refreshQuery := url.Values{}
-					refreshQuery.Set("grant_type", "refresh_token")
-					refreshQuery.Set("refresh_token", tokenCache.RefreshToken)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-p.Global.Ctx.Done():
+				return
+			case <-logoutChan:
+				_ = p.SessionLoginCache.Delete(authID)
+				p.Global.Logger.Println(clog.Info, "Logout success, username: ", username)
+				return
+			case <-time.After(2 * time.Second):
+				if p.SessionLoginCache.Exist(authID) {
+					tokenCacheLock.RLock()
+					if time.Now().Add(-60 * time.Second).After(tokenCache.ExpiredTime) {
+						refreshQuery := url.Values{}
+						refreshQuery.Set("grant_type", "refresh_token")
+						refreshQuery.Set("refresh_token", tokenCache.RefreshToken)
+						tokenCacheLock.RUnlock()
+						refreshQuery.Set("client_id", p.Config.ClientID)
+						refreshQuery.Set("client_secret", p.Config.ClientSecret)
+						var refreshResponse *http.Response
+						retry := 3
+						for {
+							refreshRequest, err := http.NewRequestWithContext(p.Global.Ctx, http.MethodPost, p.OpenidConfig.TokenEndpoint, strings.NewReader(refreshQuery.Encode()))
+							if err != nil {
+								p.Global.Logger.Println(clog.Error, fmt.Sprintf("Refresh Token request failed: %s", err))
+								if retry > 0 {
+									retry--
+									continue
+								} else {
+									_ = p.SessionLoginCache.Delete(authID)
+									return
+								}
+							}
+							refreshRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+							refreshResponse, err = p.HTTPClient.Do(refreshRequest)
+							if err != nil {
+								p.Global.Logger.Println(clog.Error, fmt.Sprintf("Refresh Token request failed: %s", err))
+								if retry > 0 {
+									retry--
+									continue
+								} else {
+									_ = p.SessionLoginCache.Delete(authID)
+									return
+								}
+							}
+							break
+						}
+						if refreshResponse.StatusCode != http.StatusOK {
+							p.Global.Logger.Println(clog.Error, fmt.Sprintf("Refresh Token request failed: %d", refreshResponse.StatusCode))
+							_ = p.SessionLoginCache.Delete(authID)
+							return
+						}
+						rawDataBuf := bytes.NewBuffer(nil)
+						_, err := io.Copy(rawDataBuf, refreshResponse.Body)
+						if err != nil {
+							p.Global.Logger.Println(clog.Error, fmt.Sprintf("Refresh Token request read failed: %s", err))
+							_ = p.SessionLoginCache.Delete(authID)
+							return
+						}
+						var newToken responseTokenStruct
+						err = json.Unmarshal(rawDataBuf.Bytes(), &newToken)
+						if err != nil {
+							p.Global.Logger.Println(clog.Error, fmt.Sprintf("Refresh Token request json parse failed: %s", err))
+							_ = p.SessionLoginCache.Delete(authID)
+							return
+						}
+						_ = refreshResponse.Body.Close()
+						tokenCacheLock.Lock()
+						tokenCache.AccessToken = newToken.AccessToken
+						tokenCache.RefreshToken = newToken.RefreshToken
+						tokenCache.ExpiredTime = time.Now().Add(time.Duration(newToken.ExpiresIn) * time.Second)
+						tokenCacheLock.Unlock()
+						p.Global.Logger.Println(clog.Info, "Refresh Token success")
+					} else {
+						tokenCacheLock.RUnlock()
+						continue
+					}
+				} else {
+					logoutQuery := url.Values{}
+					tokenCacheLock.RLock()
+					logoutQuery.Set("refresh_token", tokenCache.RefreshToken)
 					tokenCacheLock.RUnlock()
-					refreshQuery.Set("client_id", p.Config.ClientID)
-					refreshQuery.Set("client_secret", p.Config.ClientSecret)
-					var refreshResponse *http.Response
+					logoutQuery.Set("client_id", p.Config.ClientID)
+					logoutQuery.Set("client_secret", p.Config.ClientSecret)
+					var logoutResponse *http.Response
 					retry := 3
 					for {
-						refreshRequest, err := http.NewRequestWithContext(p.Global.Ctx, http.MethodPost, p.OpenidConfig.TokenEndpoint, strings.NewReader(refreshQuery.Encode()))
+						logoutRequest, err := http.NewRequestWithContext(p.Global.Ctx, http.MethodGet, p.OpenidConfig.EndSessionEndpoint, strings.NewReader(logoutQuery.Encode()))
 						if err != nil {
-							p.Global.Logger.Println(clog.Error, fmt.Sprintf("Refresh Token request failed: %s", err))
+							p.Global.Logger.Println(clog.Error, fmt.Sprintf("Logout request failed: %s", err))
 							if retry > 0 {
 								retry--
 								continue
@@ -247,10 +317,10 @@ func (p *proxy) tokenManager(authID string, token tokenStruct, username string) 
 								return
 							}
 						}
-						refreshRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-						refreshResponse, err = p.HTTPClient.Do(refreshRequest)
+						logoutRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+						logoutResponse, err = p.HTTPClient.Do(logoutRequest)
 						if err != nil {
-							p.Global.Logger.Println(clog.Error, fmt.Sprintf("Refresh Token request failed: %s", err))
+							p.Global.Logger.Println(clog.Error, fmt.Sprintf("Logout request failed: %s", err))
 							if retry > 0 {
 								retry--
 								continue
@@ -261,82 +331,20 @@ func (p *proxy) tokenManager(authID string, token tokenStruct, username string) 
 						}
 						break
 					}
-					if refreshResponse.StatusCode != http.StatusOK {
-						p.Global.Logger.Println(clog.Error, fmt.Sprintf("Refresh Token request failed: %d", refreshResponse.StatusCode))
+					if logoutResponse.StatusCode != http.StatusOK && logoutResponse.StatusCode != http.StatusNoContent {
+						p.Global.Logger.Println(clog.Error, fmt.Sprintf("Logout request failed with status code: %d", logoutResponse.StatusCode))
 						_ = p.SessionLoginCache.Delete(authID)
 						return
 					}
-					rawDataBuf := bytes.NewBuffer(nil)
-					_, err := io.Copy(rawDataBuf, refreshResponse.Body)
-					if err != nil {
-						p.Global.Logger.Println(clog.Error, fmt.Sprintf("Refresh Token request read failed: %s", err))
-						_ = p.SessionLoginCache.Delete(authID)
-						return
-					}
-					var newToken responseTokenStruct
-					err = json.Unmarshal(rawDataBuf.Bytes(), &newToken)
-					if err != nil {
-						p.Global.Logger.Println(clog.Error, fmt.Sprintf("Refresh Token request json parse failed: %s", err))
-						_ = p.SessionLoginCache.Delete(authID)
-						return
-					}
-					_ = refreshResponse.Body.Close()
-					tokenCacheLock.Lock()
-					tokenCache.AccessToken = newToken.AccessToken
-					tokenCache.RefreshToken = newToken.RefreshToken
-					tokenCache.ExpiredTime = time.Now().Add(time.Duration(newToken.ExpiresIn) * time.Second)
-					tokenCacheLock.Unlock()
-					p.Global.Logger.Println(clog.Info, "Refresh Token success")
-				} else {
-					tokenCacheLock.RUnlock()
-					continue
-				}
-			} else {
-				logoutQuery := url.Values{}
-				tokenCacheLock.RLock()
-				logoutQuery.Set("refresh_token", tokenCache.RefreshToken)
-				tokenCacheLock.RUnlock()
-				logoutQuery.Set("client_id", p.Config.ClientID)
-				logoutQuery.Set("client_secret", p.Config.ClientSecret)
-				var logoutResponse *http.Response
-				retry := 3
-				for {
-					logoutRequest, err := http.NewRequestWithContext(p.Global.Ctx, http.MethodGet, p.OpenidConfig.EndSessionEndpoint, strings.NewReader(logoutQuery.Encode()))
-					if err != nil {
-						p.Global.Logger.Println(clog.Error, fmt.Sprintf("Logout request failed: %s", err))
-						if retry > 0 {
-							retry--
-							continue
-						} else {
-							_ = p.SessionLoginCache.Delete(authID)
-							return
-						}
-					}
-					logoutRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-					logoutResponse, err = p.HTTPClient.Do(logoutRequest)
-					if err != nil {
-						p.Global.Logger.Println(clog.Error, fmt.Sprintf("Logout request failed: %s", err))
-						if retry > 0 {
-							retry--
-							continue
-						} else {
-							_ = p.SessionLoginCache.Delete(authID)
-							return
-						}
-					}
-					break
-				}
-				if logoutResponse.StatusCode != http.StatusOK && logoutResponse.StatusCode != http.StatusNoContent {
-					p.Global.Logger.Println(clog.Error, fmt.Sprintf("Logout request failed with status code: %d", logoutResponse.StatusCode))
+					p.Global.Logger.Println(clog.Info, "Logout success, username: ", username)
 					_ = p.SessionLoginCache.Delete(authID)
 					return
 				}
-				p.Global.Logger.Println(clog.Info, "Logout success, username: ", username)
-				_ = p.SessionLoginCache.Delete(authID)
-				return
 			}
 		}
-	}
+	}()
+	wg.Wait()
+	close(logoutChan)
 }
 
 func (p *proxy) getReal(c *gin.Context) (map[string]string, error) {
