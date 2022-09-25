@@ -192,16 +192,45 @@ func (p *proxy) newProxy() {
 
 func (p *proxy) tokenManager(authID string, token tokenStruct, username string) {
 	tokenCache := token
+	tokenCacheLock := sync.RWMutex{}
+	logoutChan := make(chan struct{}, 1)
+	defer close(logoutChan)
+	go func() {
+		for {
+			select {
+			case <-p.Global.Ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+				tokenCacheLock.RLock()
+				AccessTokenRead := tokenCache.AccessToken
+				tokenCacheLock.RUnlock()
+				if AccessTokenRead == "" {
+					return
+				}
+				valid, _ := p.authTokenValid(AccessTokenRead)
+				if !valid {
+					logoutChan <- struct{}{}
+					return
+				}
+			}
+		}
+	}()
 	for {
 		select {
 		case <-p.Global.Ctx.Done():
 			return
+		case <-logoutChan:
+			_ = p.SessionLoginCache.Delete(authID)
+			p.Global.Logger.Println(clog.Info, "Logout success, username: ", username)
+			return
 		case <-time.After(2 * time.Second):
 			if p.SessionLoginCache.Exist(authID) {
+				tokenCacheLock.RLock()
 				if time.Now().Add(-60 * time.Second).After(tokenCache.ExpiredTime) {
 					refreshQuery := url.Values{}
 					refreshQuery.Set("grant_type", "refresh_token")
 					refreshQuery.Set("refresh_token", tokenCache.RefreshToken)
+					tokenCacheLock.RUnlock()
 					refreshQuery.Set("client_id", p.Config.ClientID)
 					refreshQuery.Set("client_secret", p.Config.ClientSecret)
 					var refreshResponse *http.Response
@@ -252,16 +281,21 @@ func (p *proxy) tokenManager(authID string, token tokenStruct, username string) 
 						return
 					}
 					_ = refreshResponse.Body.Close()
+					tokenCacheLock.Lock()
 					tokenCache.AccessToken = newToken.AccessToken
 					tokenCache.RefreshToken = newToken.RefreshToken
 					tokenCache.ExpiredTime = time.Now().Add(time.Duration(newToken.ExpiresIn) * time.Second)
+					tokenCacheLock.Unlock()
 					p.Global.Logger.Println(clog.Info, "Refresh Token success")
 				} else {
+					tokenCacheLock.RUnlock()
 					continue
 				}
 			} else {
 				logoutQuery := url.Values{}
+				tokenCacheLock.RLock()
 				logoutQuery.Set("refresh_token", tokenCache.RefreshToken)
+				tokenCacheLock.RUnlock()
 				logoutQuery.Set("client_id", p.Config.ClientID)
 				logoutQuery.Set("client_secret", p.Config.ClientSecret)
 				var logoutResponse *http.Response
@@ -369,9 +403,9 @@ func random(n int) string {
 	return string(b)
 }
 
-func (p *proxy) authTokenValid(token responseTokenStruct) (bool, string) {
+func (p *proxy) authTokenValid(accessToken string) (bool, string) {
 	q := url.Values{}
-	q.Add("token", token.AccessToken)
+	q.Add("token", accessToken)
 	q.Add("client_id", p.Config.ClientID)
 	q.Add("client_secret", p.Config.ClientSecret)
 	retry := 3
@@ -509,7 +543,7 @@ func (p *proxy) redirectHandler(c *gin.Context) {
 		})
 		return
 	}
-	vaild, username := p.authTokenValid(token)
+	vaild, username := p.authTokenValid(token.AccessToken)
 	if !vaild {
 		p.Global.Logger.Println(clog.Error, fmt.Sprintf("[%s] token invalid", ConnectionID))
 		c.JSON(http.StatusInternalServerError, gin.H{
