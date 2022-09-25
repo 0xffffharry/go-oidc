@@ -1,0 +1,16 @@
+{
+  "server": [
+    {
+      "tag": "",
+      "listen": "",
+      "discovery_uri": "",
+      "client_id": "",
+      "client_secret": "",
+      "redirect_path": "",
+      "logout_path": "",
+      "after_logout_uri": "",
+      "scope": ["openid"],
+      "upstream": ""
+    }
+  ]
+}
