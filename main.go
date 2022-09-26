@@ -15,7 +15,7 @@ import (
 
 const (
 	AppName    = "oidc"
-	AppVersion = "v0.0.2"
+	AppVersion = "v0.0.3"
 )
 
 func main() {

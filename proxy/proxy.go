@@ -28,18 +28,19 @@ const (
 )
 
 type ProxyConfig struct {
-	Tag            string       `json:"tag"`
-	Listen         string       `json:"listen"`
-	DiscoveryUri   string       `json:"discovery_uri"`
-	ClientID       string       `json:"client_id"`
-	ClientSecret   string       `json:"client_secret"`
-	RedirectPath   string       `json:"redirect_path"`
-	LogoutPath     string       `json:"logout_path"`
-	AfterLogoutUri string       `json:"after_logout_uri"`
-	Scope          []string     `json:"scope"`
-	Upstream       string       `json:"upstream"`
-	HTTPLog        bool         `json:"http_log"`
-	Custom         openIDConfig `json:"custom"`
+	Tag             string       `json:"tag"`
+	Listen          string       `json:"listen"`
+	DiscoveryUri    string       `json:"discovery_uri"`
+	ClientID        string       `json:"client_id"`
+	ClientSecret    string       `json:"client_secret"`
+	RedirectPath    string       `json:"redirect_path"`
+	LogoutPath      string       `json:"logout_path"`
+	AfterLogoutUri  string       `json:"after_logout_uri"`
+	Scope           []string     `json:"scope"`
+	Upstream        string       `json:"upstream"`
+	HTTPLog         bool         `json:"http_log"`
+	Custom          openIDConfig `json:"custom"`
+	CheckTokenValid bool         `json:"check_token_valid"`
 }
 
 type Global struct {
@@ -225,28 +226,30 @@ func (p *proxy) tokenManager(authID string, token tokenStruct, username string) 
 	tokenCacheLock := sync.RWMutex{}
 	logoutChan := make(chan struct{}, 1)
 	wg := sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-p.Global.Ctx.Done():
-				return
-			case <-time.After(2 * time.Second):
-				tokenCacheLock.RLock()
-				AccessTokenRead := tokenCache.AccessToken
-				tokenCacheLock.RUnlock()
-				if AccessTokenRead == "" {
+	if p.Config.CheckTokenValid {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-p.Global.Ctx.Done():
 					return
-				}
-				valid, _ := p.authTokenValid(AccessTokenRead)
-				if !valid {
-					logoutChan <- struct{}{}
-					return
+				case <-time.After(2 * time.Second):
+					tokenCacheLock.RLock()
+					AccessTokenRead := tokenCache.AccessToken
+					tokenCacheLock.RUnlock()
+					if AccessTokenRead == "" {
+						return
+					}
+					valid, _ := p.authTokenValid(AccessTokenRead)
+					if !valid {
+						logoutChan <- struct{}{}
+						return
+					}
 				}
 			}
-		}
-	}()
+		}()
+	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
