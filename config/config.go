@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/url"
 	"oidc/proxy"
@@ -48,11 +49,13 @@ func ParseConfig(filename string) (*Config, error) {
 			cache[hostWithPort] = true
 		}
 		config.Servers[k].Listen = hostWithPort
-		discoveryUri, err := url.Parse(v.DiscoveryUri)
-		if err != nil {
-			return nil, errors.New("invalid DiscoveryUri")
+		if v.DiscoveryUri != "" {
+			if u, err := url.Parse(v.DiscoveryUri); err != nil {
+				return nil, errors.New("invalid DiscoveryUri")
+			} else {
+				config.Servers[k].DiscoveryUri = u.String()
+			}
 		}
-		config.Servers[k].DiscoveryUri = discoveryUri.String()
 		if v.ClientID == "" {
 			return nil, errors.New("no ClientID")
 		}
@@ -87,6 +90,41 @@ func ParseConfig(filename string) (*Config, error) {
 		}
 		if v.Upstream == "" {
 			return nil, errors.New("no Upstream")
+		}
+		if u, err := url.Parse(v.Custom.AuthorizationEndpoint); err != nil {
+			return nil, errors.New("invalid authorization_endpoint")
+		} else {
+			config.Servers[k].Custom.AuthorizationEndpoint = u.String()
+		}
+		if u, err := url.Parse(v.Custom.TokenEndpoint); err != nil {
+			return nil, errors.New("invalid token_endpoint")
+		} else {
+			config.Servers[k].Custom.TokenEndpoint = u.String()
+		}
+		if u, err := url.Parse(v.Custom.UserinfoEndpoint); err != nil {
+			return nil, errors.New("invalid userinfo_endpoint")
+		} else {
+			config.Servers[k].Custom.UserinfoEndpoint = u.String()
+		}
+		if u, err := url.Parse(v.Custom.IntrospectionEndpoint); err != nil {
+			return nil, errors.New("invalid introspection_endpoint")
+		} else {
+			config.Servers[k].Custom.IntrospectionEndpoint = u.String()
+		}
+		if u, err := url.Parse(v.Custom.EndSessionEndpoint); err != nil {
+			return nil, errors.New("invalid end_session_endpoint")
+		} else {
+			config.Servers[k].Custom.EndSessionEndpoint = u.String()
+		}
+		if fmt.Sprintf("%s%s%s%s%s%s",
+			v.DiscoveryUri,
+			v.Custom.AuthorizationEndpoint,
+			v.Custom.TokenEndpoint,
+			v.Custom.UserinfoEndpoint,
+			v.Custom.IntrospectionEndpoint,
+			v.Custom.EndSessionEndpoint,
+		) == "" {
+			return nil, errors.New("no custom endpoints and no discovery_uri")
 		}
 	}
 	return &config, nil

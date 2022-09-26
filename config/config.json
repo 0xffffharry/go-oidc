@@ -10,7 +10,15 @@
       "logout_path": "",
       "after_logout_uri": "",
       "scope": ["openid"],
-      "upstream": ""
+      "upstream": "",
+      "http_log": false,
+      "custom": {
+        "authorization_endpoint": "",
+        "token_endpoint": "",
+        "end_session_endpoint": "",
+        "introspection_endpoint": "",
+        "userinfo_endpoint": ""
+      }
     }
   ]
 }

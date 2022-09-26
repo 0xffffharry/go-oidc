@@ -28,17 +28,18 @@ const (
 )
 
 type ProxyConfig struct {
-	Tag            string   `json:"tag"`
-	Listen         string   `json:"listen"`
-	DiscoveryUri   string   `json:"discovery_uri"`
-	ClientID       string   `json:"client_id"`
-	ClientSecret   string   `json:"client_secret"`
-	RedirectPath   string   `json:"redirect_path"`
-	LogoutPath     string   `json:"logout_path"`
-	AfterLogoutUri string   `json:"after_logout_uri"`
-	Scope          []string `json:"scope"`
-	Upstream       string   `json:"upstream"`
-	HTTPLog        bool     `json:"http_log"`
+	Tag            string       `json:"tag"`
+	Listen         string       `json:"listen"`
+	DiscoveryUri   string       `json:"discovery_uri"`
+	ClientID       string       `json:"client_id"`
+	ClientSecret   string       `json:"client_secret"`
+	RedirectPath   string       `json:"redirect_path"`
+	LogoutPath     string       `json:"logout_path"`
+	AfterLogoutUri string       `json:"after_logout_uri"`
+	Scope          []string     `json:"scope"`
+	Upstream       string       `json:"upstream"`
+	HTTPLog        bool         `json:"http_log"`
+	Custom         openIDConfig `json:"custom"`
 }
 
 type Global struct {
@@ -112,34 +113,63 @@ func (p *proxy) newProxy() {
 		client := &http.Client{Transport: http.DefaultTransport}
 		p.HTTPClient = client
 	}
-	var discoveryResponse *http.Response
-	for {
-		discoveryRequest, err := http.NewRequestWithContext(p.Global.Ctx, http.MethodGet, p.Config.DiscoveryUri, nil)
-		if err != nil {
-			p.Global.Logger.Println(clog.Error, err, "Retry in 3 seconds...")
-			time.Sleep(3 * time.Second)
-			continue
+	if p.Config.DiscoveryUri != "" {
+		var discoveryResponse *http.Response
+		for {
+			discoveryRequest, err := http.NewRequestWithContext(p.Global.Ctx, http.MethodGet, p.Config.DiscoveryUri, nil)
+			if err != nil {
+				p.Global.Logger.Println(clog.Error, err, "Retry in 3 seconds...")
+				time.Sleep(3 * time.Second)
+				continue
+			}
+			discoveryResponse, err = p.HTTPClient.Do(discoveryRequest)
+			if err != nil {
+				p.Global.Logger.Println(clog.Error, err, "Retry in 3 seconds...")
+				time.Sleep(3 * time.Second)
+				continue
+			}
+			if discoveryResponse.StatusCode != http.StatusOK {
+				p.Global.Logger.Fatalln(clog.Fatal, "Discovery request failed with status code:", discoveryResponse.StatusCode)
+				return
+			}
+			break
 		}
-		discoveryResponse, err = p.HTTPClient.Do(discoveryRequest)
+		var openidConfiguration openIDConfig
+		err := json.NewDecoder(discoveryResponse.Body).Decode(&openidConfiguration)
 		if err != nil {
-			p.Global.Logger.Println(clog.Error, err, "Retry in 3 seconds...")
-			time.Sleep(3 * time.Second)
-			continue
-		}
-		if discoveryResponse.StatusCode != http.StatusOK {
-			p.Global.Logger.Fatalln(clog.Fatal, "Discovery request failed with status code:", discoveryResponse.StatusCode)
+			p.Global.Logger.Fatalln(clog.Fatal, "Discovery request json parse fail: ", err)
 			return
 		}
-		break
+		_ = discoveryResponse.Body.Close()
+		p.OpenidConfig = openidConfiguration
+	} else {
+		p.OpenidConfig = openIDConfig{}
 	}
-	var openidConfiguration openIDConfig
-	err := json.NewDecoder(discoveryResponse.Body).Decode(&openidConfiguration)
-	if err != nil {
-		p.Global.Logger.Fatalln(clog.Fatal, "Discovery request json parse fail: ", err)
+	if p.Config.Custom.AuthorizationEndpoint != "" {
+		p.OpenidConfig.AuthorizationEndpoint = p.Config.Custom.AuthorizationEndpoint
+	}
+	if p.Config.Custom.TokenEndpoint != "" {
+		p.OpenidConfig.TokenEndpoint = p.Config.Custom.TokenEndpoint
+	}
+	if p.Config.Custom.EndSessionEndpoint != "" {
+		p.OpenidConfig.EndSessionEndpoint = p.Config.Custom.EndSessionEndpoint
+	}
+	if p.Config.Custom.IntrospectionEndpoint != "" {
+		p.OpenidConfig.IntrospectionEndpoint = p.Config.Custom.IntrospectionEndpoint
+	}
+	if p.Config.Custom.UserinfoEndpoint != "" {
+		p.OpenidConfig.UserinfoEndpoint = p.Config.Custom.UserinfoEndpoint
+	}
+	if fmt.Sprintf("%s%s%s%s%s",
+		p.OpenidConfig.AuthorizationEndpoint,
+		p.OpenidConfig.TokenEndpoint,
+		p.OpenidConfig.UserinfoEndpoint,
+		p.OpenidConfig.IntrospectionEndpoint,
+		p.OpenidConfig.EndSessionEndpoint,
+	) == "" {
+		p.Global.Logger.Fatalln(clog.Fatal, "no custom endpoints")
 		return
 	}
-	_ = discoveryResponse.Body.Close()
-	p.OpenidConfig = openidConfiguration
 	p.SessionCache = cachemap.New(p.Global.Ctx, 1*time.Second)
 	p.SessionLoginCache = cachemap.New(p.Global.Ctx, 1*time.Second)
 	router := gin.New()
@@ -180,7 +210,7 @@ func (p *proxy) newProxy() {
 		_ = server.Shutdown(context.Background())
 	}()
 	p.Global.Logger.Println(clog.Info, "Gin Server - "+p.Config.Tag+" start at ", p.Config.Listen)
-	err = server.ListenAndServe()
+	err := server.ListenAndServe()
 	if err != nil {
 		if err == http.ErrServerClosed {
 			p.Global.Logger.Println(clog.Warning, fmt.Sprintf("[Gin Server - %s]: server closed", p.Config.Tag))
@@ -238,6 +268,7 @@ func (p *proxy) tokenManager(authID string, token tokenStruct, username string) 
 						tokenCacheLock.RUnlock()
 						refreshQuery.Set("client_id", p.Config.ClientID)
 						refreshQuery.Set("client_secret", p.Config.ClientSecret)
+						refreshQuery.Set("scope", strings.Join(p.Config.Scope, " "))
 						var refreshResponse *http.Response
 						retry := 3
 						for {
@@ -297,44 +328,46 @@ func (p *proxy) tokenManager(authID string, token tokenStruct, username string) 
 						continue
 					}
 				} else {
-					logoutQuery := url.Values{}
-					tokenCacheLock.RLock()
-					logoutQuery.Set("refresh_token", tokenCache.RefreshToken)
-					tokenCacheLock.RUnlock()
-					logoutQuery.Set("client_id", p.Config.ClientID)
-					logoutQuery.Set("client_secret", p.Config.ClientSecret)
-					var logoutResponse *http.Response
-					retry := 3
-					for {
-						logoutRequest, err := http.NewRequestWithContext(p.Global.Ctx, http.MethodGet, p.OpenidConfig.EndSessionEndpoint, strings.NewReader(logoutQuery.Encode()))
-						if err != nil {
-							p.Global.Logger.Println(clog.Error, fmt.Sprintf("Logout request failed: %s", err))
-							if retry > 0 {
-								retry--
-								continue
-							} else {
-								_ = p.SessionLoginCache.Delete(authID)
-								return
+					if p.OpenidConfig.EndSessionEndpoint != "" {
+						logoutQuery := url.Values{}
+						tokenCacheLock.RLock()
+						logoutQuery.Set("refresh_token", tokenCache.RefreshToken)
+						tokenCacheLock.RUnlock()
+						logoutQuery.Set("client_id", p.Config.ClientID)
+						logoutQuery.Set("client_secret", p.Config.ClientSecret)
+						var logoutResponse *http.Response
+						retry := 3
+						for {
+							logoutRequest, err := http.NewRequestWithContext(p.Global.Ctx, http.MethodGet, p.OpenidConfig.EndSessionEndpoint, strings.NewReader(logoutQuery.Encode()))
+							if err != nil {
+								p.Global.Logger.Println(clog.Error, fmt.Sprintf("Logout request failed: %s", err))
+								if retry > 0 {
+									retry--
+									continue
+								} else {
+									_ = p.SessionLoginCache.Delete(authID)
+									return
+								}
 							}
-						}
-						logoutRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-						logoutResponse, err = p.HTTPClient.Do(logoutRequest)
-						if err != nil {
-							p.Global.Logger.Println(clog.Error, fmt.Sprintf("Logout request failed: %s", err))
-							if retry > 0 {
-								retry--
-								continue
-							} else {
-								_ = p.SessionLoginCache.Delete(authID)
-								return
+							logoutRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+							logoutResponse, err = p.HTTPClient.Do(logoutRequest)
+							if err != nil {
+								p.Global.Logger.Println(clog.Error, fmt.Sprintf("Logout request failed: %s", err))
+								if retry > 0 {
+									retry--
+									continue
+								} else {
+									_ = p.SessionLoginCache.Delete(authID)
+									return
+								}
 							}
+							break
 						}
-						break
-					}
-					if logoutResponse.StatusCode != http.StatusOK && logoutResponse.StatusCode != http.StatusNoContent {
-						p.Global.Logger.Println(clog.Error, fmt.Sprintf("Logout request failed with status code: %d", logoutResponse.StatusCode))
-						_ = p.SessionLoginCache.Delete(authID)
-						return
+						if logoutResponse.StatusCode != http.StatusOK && logoutResponse.StatusCode != http.StatusNoContent {
+							p.Global.Logger.Println(clog.Error, fmt.Sprintf("Logout request failed with status code: %d", logoutResponse.StatusCode))
+							_ = p.SessionLoginCache.Delete(authID)
+							return
+						}
 					}
 					p.Global.Logger.Println(clog.Info, "Logout success, username: ", username)
 					_ = p.SessionLoginCache.Delete(authID)
@@ -416,6 +449,7 @@ func (p *proxy) authTokenValid(accessToken string) (bool, string) {
 	q.Add("token", accessToken)
 	q.Add("client_id", p.Config.ClientID)
 	q.Add("client_secret", p.Config.ClientSecret)
+	q.Add("token_type_hint", "access_token")
 	retry := 3
 	for {
 		req, err := http.NewRequestWithContext(p.Global.Ctx, http.MethodPost, p.OpenidConfig.IntrospectionEndpoint, strings.NewReader(q.Encode()))
@@ -447,7 +481,8 @@ func (p *proxy) authTokenValid(accessToken string) (bool, string) {
 		}
 		type ResponseStruct struct {
 			Active   bool   `json:"active"`
-			Username string `json:"name"`
+			Username string `json:"username"`
+			Name     string `json:"name"`
 		}
 		var r ResponseStruct
 		err = json.Unmarshal(rawDataBuf.Bytes(), &r)
@@ -455,7 +490,11 @@ func (p *proxy) authTokenValid(accessToken string) (bool, string) {
 			p.Global.Logger.Println(clog.Error, fmt.Sprintf("token auth valid fail: json parse fail: %s", err))
 			return false, ""
 		}
-		return r.Active, r.Username
+		if r.Name != "" {
+			return r.Active, r.Name
+		} else {
+			return r.Active, r.Username
+		}
 	}
 }
 
